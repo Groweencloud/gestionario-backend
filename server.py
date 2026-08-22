@@ -754,22 +754,22 @@ async def get_catering(catering_id: str, user: dict = Depends(get_current_user))
     item = (await enrich_caterings([doc], user))[0]
     rows = await db.availabilities.find({"catering_id": catering_id}).to_list(5000)
     stato_by_user = {r["user_id"]: r for r in rows}
-    # restrict visible employees for non-admins to those explicitly assigned
+    assigned = [str(a) for a in (doc.get("assigned") or []) if a]
     if user.get("ruolo") != "admin":
-        assigned = doc.get("assigned") or []
-        # deny access if the user is not assigned to this catering
+        # only users explicitly assigned can access this catering when the list exists;
+        # for legacy data without an assignment list, fall back to all active employees
         if assigned and str(user["_id"]) not in assigned:
             raise HTTPException(status_code=403, detail="Accesso non consentito")
-        if not assigned:
-            emp = []
-        else:
+        if assigned:
             obj_ids = []
             for a in assigned:
                 try:
                     obj_ids.append(ObjectId(a))
                 except Exception:
                     continue
-            emp = await db.users.find({"_id": {"$in": obj_ids}}).sort("nome", 1).to_list(500)
+            emp = await db.users.find({"_id": {"$in": obj_ids}, "ruolo": "dipendente", "stato": "attivo"}).sort("nome", 1).to_list(500)
+        else:
+            emp = await db.users.find({"ruolo": "dipendente", "stato": "attivo"}).sort("nome", 1).to_list(500)
     else:
         emp = await db.users.find({"ruolo": "dipendente", "stato": "attivo"}).sort("nome", 1).to_list(500)
     gruppi = {"disponibile": [], "non_disponibile": [], "in_attesa": []}
