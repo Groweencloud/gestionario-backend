@@ -11,3 +11,4 @@ PyJWT
 requests
 python-multipart
 python-dotenv
+httpx
