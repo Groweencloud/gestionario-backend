@@ -9,3 +9,4 @@ bcrypt
 python-jose
 requests
 python-multipart
+python-dotenv
