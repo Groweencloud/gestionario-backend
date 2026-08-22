@@ -120,6 +120,7 @@ class CateringIn(BaseModel):
     scadenza_risposta: Optional[str] = None
     stato: str = "programmato"
     compenso: Optional[float] = None
+    assigned: Optional[List[str]] = None
 
 
 class PresenzaIn(BaseModel):
@@ -224,6 +225,8 @@ async def enrich_caterings(docs: List[dict], user: dict) -> List[dict]:
         conf = len([r for r in rows if r["stato"] == "disponibile"])
         rif = len([r for r in rows if r["stato"] == "non_disponibile"])
         item = serialize_catering(d)
+        # include assigned list for frontend usage
+        item["assigned"] = d.get("assigned", [])
         item["confermati"] = conf
         item["non_disponibili"] = rif
         item["senza_risposta"] = max(n_emp - conf - rif, 0)
@@ -648,6 +651,15 @@ async def list_caterings(
         if a:
             rng["$lte"] = a
         query["data"] = rng
+    # limit non-admin users: if a catering has a non-empty `assigned` list,
+    # only users in that list should see it; if `assigned` is missing or empty,
+    # it remains visible to everyone.
+    if user.get("ruolo") != "admin":
+        query["$or"] = [
+            {"assigned": {"$in": [str(user["_id"]) ]}},
+            {"assigned": {"$exists": False}},
+            {"assigned": {"$size": 0}},
+        ]
     docs = await db.caterings.find(query).sort("data", 1).to_list(2000)
     items = await enrich_caterings(docs, user)
     if luogo:
@@ -687,22 +699,46 @@ async def create_catering(payload: CateringIn, admin: dict = Depends(require_adm
     doc["updated_at"] = iso_now()
     doc["created_by"] = str(admin["_id"])
     doc["risposte_riaperte"] = False
+    # normalize assigned if present
+    if doc.get("assigned"):
+        doc["assigned"] = [str(x) for x in doc.get("assigned") if x]
+
     res = await db.caterings.insert_one(doc)
     cid = str(res.inserted_id)
     await log_activity(admin, "creazione_catering", f"Ha creato il catering «{doc['titolo']}»", cid)
-    await broadcast_employees(
-        "nuovo_catering",
-        f"Nuovo catering: «{doc['titolo']}» il {doc['data']}. Comunica la tua disponibilità.",
-        cid,
-        f"Nuovo catering: {doc['titolo']}",
-        [
-            f"È stato pubblicato un nuovo catering: {doc['titolo']}.",
-            f"Data: {doc['data']} — Orario: {doc['ora_inizio']} {('- ' + doc['ora_fine']) if doc['ora_fine'] else ''}",
-            f"Luogo: {doc['luogo']} — {doc['indirizzo']}",
-            f"Personale richiesto: {doc['personale_richiesto']}",
-            "Accedi al gestionale per comunicare la tua disponibilità.",
-        ],
-    )
+    # notify assigned employees if provided, otherwise broadcast to all active employees
+    if doc.get("assigned"):
+        settings = await get_settings()
+        for uid in doc.get("assigned", []):
+            try:
+                u = await db.users.find_one({"_id": ObjectId(uid)})
+            except Exception:
+                u = None
+            if not u:
+                continue
+            if settings.get("notifiche_interne", True):
+                await notify(str(u["_id"]), "nuovo_catering", f"Sei stato assegnato a: «{doc['titolo']}».", cid)
+            if settings.get("notifiche_email", True):
+                queue_send(u["email"], f"Nuovo catering: {doc['titolo']}", [
+                    f"Sei stato assegnato al catering: {doc['titolo']}.",
+                    f"Data: {doc['data']} — Orario: {doc['ora_inizio']} {('- ' + doc['ora_fine']) if doc['ora_fine'] else ''}",
+                    f"Luogo: {doc['luogo']} — {doc['indirizzo']}",
+                    "Controlla il gestionale per i dettagli.",
+                ])
+    else:
+        await broadcast_employees(
+            "nuovo_catering",
+            f"Nuovo catering: «{doc['titolo']}» il {doc['data']}. Comunica la tua disponibilità.",
+            cid,
+            f"Nuovo catering: {doc['titolo']}",
+            [
+                f"È stato pubblicato un nuovo catering: {doc['titolo']}.",
+                f"Data: {doc['data']} — Orario: {doc['ora_inizio']} {('- ' + doc['ora_fine']) if doc['ora_fine'] else ''}",
+                f"Luogo: {doc['luogo']} — {doc['indirizzo']}",
+                f"Personale richiesto: {doc['personale_richiesto']}",
+                "Accedi al gestionale per comunicare la tua disponibilità.",
+            ],
+        )
     doc["_id"] = res.inserted_id
     return (await enrich_caterings([doc], admin))[0]
 
@@ -718,7 +754,24 @@ async def get_catering(catering_id: str, user: dict = Depends(get_current_user))
     item = (await enrich_caterings([doc], user))[0]
     rows = await db.availabilities.find({"catering_id": catering_id}).to_list(5000)
     stato_by_user = {r["user_id"]: r for r in rows}
-    emp = await db.users.find({"ruolo": "dipendente", "stato": "attivo"}).sort("nome", 1).to_list(500)
+    # restrict visible employees for non-admins to those explicitly assigned
+    if user.get("ruolo") != "admin":
+        assigned = doc.get("assigned") or []
+        # deny access if the user is not assigned to this catering
+        if assigned and str(user["_id"]) not in assigned:
+            raise HTTPException(status_code=403, detail="Accesso non consentito")
+        if not assigned:
+            emp = []
+        else:
+            obj_ids = []
+            for a in assigned:
+                try:
+                    obj_ids.append(ObjectId(a))
+                except Exception:
+                    continue
+            emp = await db.users.find({"_id": {"$in": obj_ids}}).sort("nome", 1).to_list(500)
+    else:
+        emp = await db.users.find({"ruolo": "dipendente", "stato": "attivo"}).sort("nome", 1).to_list(500)
     gruppi = {"disponibile": [], "non_disponibile": [], "in_attesa": []}
     for e in emp:
         r = stato_by_user.get(str(e["_id"]))
@@ -750,6 +803,9 @@ async def update_catering(catering_id: str, payload: CateringIn, admin: dict = D
     if not updates.get("scadenza_risposta"):
         updates["scadenza_risposta"] = old.get("scadenza_risposta")
     updates["updated_at"] = iso_now()
+    # normalize assigned if provided
+    if updates.get("assigned") is not None:
+        updates["assigned"] = [str(x) for x in updates.get("assigned") if x]
     await db.caterings.update_one({"_id": old["_id"]}, {"$set": updates})
     cambi = [
         k for k in ("data", "ora_inizio", "ora_fine", "luogo", "indirizzo", "personale_richiesto", "stato")
@@ -757,18 +813,37 @@ async def update_catering(catering_id: str, payload: CateringIn, admin: dict = D
     ]
     await log_activity(admin, "modifica_catering", f"Ha modificato il catering «{updates['titolo']}»", catering_id)
     if cambi:
-        await broadcast_employees(
-            "modifica_catering",
-            f"Il catering «{updates['titolo']}» è stato modificato ({', '.join(cambi)}).",
-            catering_id,
-            f"Catering modificato: {updates['titolo']}",
-            [
-                f"Il catering {updates['titolo']} è stato aggiornato.",
-                f"Data: {updates['data']} — Orario: {updates['ora_inizio']}",
-                f"Luogo: {updates['luogo']} — {updates['indirizzo']}",
-                "Controlla il gestionale e verifica la tua disponibilità.",
-            ],
-        )
+        # notify assigned employees if present, otherwise broadcast to all
+        if updates.get("assigned"):
+            settings = await get_settings()
+            for uid in updates.get("assigned", []):
+                try:
+                    u = await db.users.find_one({"_id": ObjectId(uid)})
+                except Exception:
+                    u = None
+                if not u:
+                    continue
+                if settings.get("notifiche_interne", True):
+                    await notify(str(u["_id"]), "modifica_catering", f"Il catering «{updates['titolo']}» è stato modificato.", catering_id)
+                if settings.get("notifiche_email", True):
+                    queue_send(u["email"], f"Catering modificato: {updates['titolo']}", [
+                        f"Il catering {updates['titolo']} è stato aggiornato.",
+                        f"Data: {updates['data']} — Orario: {updates['ora_inizio']}",
+                        f"Luogo: {updates['luogo']} — {updates['indirizzo']}",
+                    ])
+        else:
+            await broadcast_employees(
+                "modifica_catering",
+                f"Il catering «{updates['titolo']}» è stato modificato ({', '.join(cambi)}).",
+                catering_id,
+                f"Catering modificato: {updates['titolo']}",
+                [
+                    f"Il catering {updates['titolo']} è stato aggiornato.",
+                    f"Data: {updates['data']} — Orario: {updates['ora_inizio']}",
+                    f"Luogo: {updates['luogo']} — {updates['indirizzo']}",
+                    "Controlla il gestionale e verifica la tua disponibilità.",
+                ],
+            )
     await refresh_stato(catering_id)
     doc = await db.caterings.find_one({"_id": old["_id"]})
     return (await enrich_caterings([doc], admin))[0]
@@ -1044,7 +1119,14 @@ async def paga_tutto(user_id: str, admin: dict = Depends(require_admin)):
 @api.get("/dashboard")
 async def dashboard(user: dict = Depends(get_current_user)):
     oggi = now_utc().strftime("%Y-%m-%d")
-    docs = await db.caterings.find({"data": {"$gte": oggi}, "stato": {"$ne": "annullato"}}).sort("data", 1).to_list(500)
+    query = {"data": {"$gte": oggi}, "stato": {"$ne": "annullato"}}
+    if user.get("ruolo") != "admin":
+        query["$or"] = [
+            {"assigned": {"$in": [str(user["_id"]) ]}},
+            {"assigned": {"$exists": False}},
+            {"assigned": {"$size": 0}},
+        ]
+    docs = await db.caterings.find(query).sort("data", 1).to_list(500)
     items = await enrich_caterings(docs, user)
     oggi_items = [i for i in items if i["data"] == oggi]
     return {
@@ -1161,6 +1243,7 @@ app.add_middleware(
 async def startup():
     await db.users.create_index("email", unique=True)
     await db.availabilities.create_index([("catering_id", 1), ("user_id", 1)], unique=True)
+    await db.caterings.create_index("assigned")
     await db.notifications.create_index([("user_id", 1)])
     await db.presenze.create_index([("catering_id", 1), ("user_id", 1)], unique=True)
     await db.login_attempts.create_index("identifier")
