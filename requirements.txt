@@ -12,3 +12,4 @@ requests
 python-multipart
 python-dotenv
 httpx
+certifi
