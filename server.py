@@ -122,6 +122,7 @@ class CateringIn(BaseModel):
     compenso: Optional[float] = None
     prezzo_a_persona: Optional[float] = None
     numero_persone: Optional[int] = None
+    servizi_extra: List[dict] = Field(default_factory=list)
     assigned: Optional[List[str]] = None
 
 
@@ -229,12 +230,14 @@ async def enrich_caterings(docs: List[dict], user: dict) -> List[dict]:
         item = serialize_catering(d)
         # include assigned list and financial summary for frontend usage
         item["assigned"] = d.get("assigned", [])
-        item["prezzo_a_persona"] = d.get("prezzo_a_persona")
-        item["numero_persone"] = d.get("numero_persone")
-        fin = await financial_summary_for_catering(d)
-        item["incasso_totale"] = fin["incasso_totale"]
-        item["costi_personale_stimati"] = fin["costi_personale_stimati"]
-        item["guadagno_netto"] = fin["guadagno_netto"]
+        if user.get("ruolo") == "admin":
+            item["prezzo_a_persona"] = d.get("prezzo_a_persona")
+            item["numero_persone"] = d.get("numero_persone")
+            item["servizi_extra"] = d.get("servizi_extra", [])
+            fin = await financial_summary_for_catering(d)
+            item["incasso_totale"] = fin["incasso_totale"]
+            item["costi_personale_stimati"] = fin["costi_personale_stimati"]
+            item["guadagno_netto"] = fin["guadagno_netto"]
         item["confermati"] = conf
         item["non_disponibili"] = rif
         item["senza_risposta"] = max(n_emp - conf - rif, 0)
@@ -266,7 +269,15 @@ async def refresh_stato(catering_id: str):
 async def financial_summary_for_catering(catering: dict) -> dict:
     prezzo = float(catering.get("prezzo_a_persona") or 0)
     persone = int(catering.get("numero_persone") or 0)
-    incasso = round(prezzo * persone, 2)
+    ricavo_base = prezzo * persone
+    servizi_extra = []
+    for servizio in catering.get("servizi_extra") or []:
+        descrizione = str(servizio.get("descrizione", "")).strip()
+        importo = float(servizio.get("importo") or 0)
+        if descrizione or importo:
+            servizi_extra.append({"descrizione": descrizione, "importo": round(importo, 2)})
+    totale_extra = sum(servizio["importo"] for servizio in servizi_extra)
+    incasso = round(ricavo_base + totale_extra, 2)
     catering_id = str(catering.get("_id") or catering.get("id") or "")
     costi = 0.0
     if catering_id:
@@ -276,6 +287,9 @@ async def financial_summary_for_catering(catering: dict) -> dict:
     return {
         "prezzo_a_persona": round(prezzo, 2),
         "numero_persone": persone,
+        "ricavo_base": round(ricavo_base, 2),
+        "servizi_extra": servizi_extra,
+        "totale_extra": round(totale_extra, 2),
         "incasso_totale": incasso,
         "costi_personale_stimati": costi,
         "guadagno_netto": guadagno,
@@ -1210,6 +1224,7 @@ async def stats(admin: dict = Depends(require_admin)):
                 "luogo": d.get("luogo", ""),
                 "prezzo_a_persona": fin["prezzo_a_persona"],
                 "numero_persone": fin["numero_persone"],
+                "totale_extra": fin["totale_extra"],
                 "incasso_totale": fin["incasso_totale"],
                 "costi_personale_stimati": fin["costi_personale_stimati"],
                 "guadagno_netto": fin["guadagno_netto"],
