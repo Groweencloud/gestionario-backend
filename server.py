@@ -120,6 +120,8 @@ class CateringIn(BaseModel):
     scadenza_risposta: Optional[str] = None
     stato: str = "programmato"
     compenso: Optional[float] = None
+    prezzo_a_persona: Optional[float] = None
+    numero_persone: Optional[int] = None
     assigned: Optional[List[str]] = None
 
 
@@ -225,8 +227,14 @@ async def enrich_caterings(docs: List[dict], user: dict) -> List[dict]:
         conf = len([r for r in rows if r["stato"] == "disponibile"])
         rif = len([r for r in rows if r["stato"] == "non_disponibile"])
         item = serialize_catering(d)
-        # include assigned list for frontend usage
+        # include assigned list and financial summary for frontend usage
         item["assigned"] = d.get("assigned", [])
+        item["prezzo_a_persona"] = d.get("prezzo_a_persona")
+        item["numero_persone"] = d.get("numero_persone")
+        fin = await financial_summary_for_catering(d)
+        item["incasso_totale"] = fin["incasso_totale"]
+        item["costi_personale_stimati"] = fin["costi_personale_stimati"]
+        item["guadagno_netto"] = fin["guadagno_netto"]
         item["confermati"] = conf
         item["non_disponibili"] = rif
         item["senza_risposta"] = max(n_emp - conf - rif, 0)
@@ -253,6 +261,25 @@ async def refresh_stato(catering_id: str):
                 await notify(str(a["_id"]), "personale_completo",
                              f"Personale completo per «{doc['titolo']}».", catering_id)
     return doc
+
+
+async def financial_summary_for_catering(catering: dict) -> dict:
+    prezzo = float(catering.get("prezzo_a_persona") or 0)
+    persone = int(catering.get("numero_persone") or 0)
+    incasso = round(prezzo * persone, 2)
+    catering_id = str(catering.get("_id") or catering.get("id") or "")
+    costi = 0.0
+    if catering_id:
+        rows = await db.presenze.find({"catering_id": catering_id, "presente": True}).to_list(5000)
+        costi = round(sum(float(r.get("importo", 0) or 0) for r in rows), 2)
+    guadagno = round(incasso - costi, 2)
+    return {
+        "prezzo_a_persona": round(prezzo, 2),
+        "numero_persone": persone,
+        "incasso_totale": incasso,
+        "costi_personale_stimati": costi,
+        "guadagno_netto": guadagno,
+    }
 
 
 # ---------------------------------------------------------------- auth
@@ -1169,6 +1196,29 @@ async def stats(admin: dict = Depends(require_admin)):
         mese = (d.get("data") or "")[:7]
         if mese:
             per_mese[mese] = per_mese.get(mese, 0) + 1
+    bilancio = {"totale_incassi": 0.0, "totale_costi_personale": 0.0, "totale_guadagno_netto": 0.0, "catering": []}
+    for d in docs:
+        fin = await financial_summary_for_catering(d)
+        bilancio["totale_incassi"] += fin["incasso_totale"]
+        bilancio["totale_costi_personale"] += fin["costi_personale_stimati"]
+        bilancio["totale_guadagno_netto"] += fin["guadagno_netto"]
+        bilancio["catering"].append(
+            {
+                "id": str(d["_id"]),
+                "titolo": d.get("titolo", ""),
+                "data": d.get("data", ""),
+                "luogo": d.get("luogo", ""),
+                "prezzo_a_persona": fin["prezzo_a_persona"],
+                "numero_persone": fin["numero_persone"],
+                "incasso_totale": fin["incasso_totale"],
+                "costi_personale_stimati": fin["costi_personale_stimati"],
+                "guadagno_netto": fin["guadagno_netto"],
+            }
+        )
+    bilancio["catering"].sort(key=lambda x: x["data"], reverse=True)
+    bilancio["totale_incassi"] = round(bilancio["totale_incassi"], 2)
+    bilancio["totale_costi_personale"] = round(bilancio["totale_costi_personale"], 2)
+    bilancio["totale_guadagno_netto"] = round(bilancio["totale_guadagno_netto"], 2)
     return {
         "totale_catering": totale_eventi,
         "completati": len([d for d in docs if d["stato"] == "terminato"]),
@@ -1181,6 +1231,7 @@ async def stats(admin: dict = Depends(require_admin)):
             {"stato": s, "valore": len([d for d in docs if d["stato"] == s])}
             for s in STATI_CATERING
         ],
+        "bilancio": bilancio,
     }
 
 
