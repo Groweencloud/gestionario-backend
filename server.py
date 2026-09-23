@@ -228,7 +228,6 @@ async def enrich_caterings(docs: List[dict], user: dict) -> List[dict]:
         conf = len([r for r in rows if r["stato"] == "disponibile"])
         rif = len([r for r in rows if r["stato"] == "non_disponibile"])
         item = serialize_catering(d)
-        # include assigned list and financial summary for frontend usage
         item["assigned"] = d.get("assigned", [])
         if user.get("ruolo") == "admin":
             item["prezzo_a_persona"] = d.get("prezzo_a_persona")
@@ -692,9 +691,6 @@ async def list_caterings(
         if a:
             rng["$lte"] = a
         query["data"] = rng
-    # limit non-admin users: if a catering has a non-empty `assigned` list,
-    # only users in that list should see it; if `assigned` is missing or empty,
-    # it remains visible to everyone.
     if user.get("ruolo") != "admin":
         query["$or"] = [
             {"assigned": {"$in": [str(user["_id"]) ]}},
@@ -740,14 +736,12 @@ async def create_catering(payload: CateringIn, admin: dict = Depends(require_adm
     doc["updated_at"] = iso_now()
     doc["created_by"] = str(admin["_id"])
     doc["risposte_riaperte"] = False
-    # normalize assigned if present
     if doc.get("assigned"):
         doc["assigned"] = [str(x) for x in doc.get("assigned") if x]
 
     res = await db.caterings.insert_one(doc)
     cid = str(res.inserted_id)
     await log_activity(admin, "creazione_catering", f"Ha creato il catering «{doc['titolo']}»", cid)
-    # notify assigned employees if provided, otherwise broadcast to all active employees
     if doc.get("assigned"):
         settings = await get_settings()
         for uid in doc.get("assigned", []):
@@ -797,8 +791,6 @@ async def get_catering(catering_id: str, user: dict = Depends(get_current_user))
     stato_by_user = {r["user_id"]: r for r in rows}
     assigned = [str(a) for a in (doc.get("assigned") or []) if a]
     if user.get("ruolo") != "admin":
-        # only users explicitly assigned can access this catering when the list exists;
-        # for legacy data without an assignment list, fall back to all active employees
         if assigned and str(user["_id"]) not in assigned:
             raise HTTPException(status_code=403, detail="Accesso non consentito")
         if assigned:
@@ -844,7 +836,6 @@ async def update_catering(catering_id: str, payload: CateringIn, admin: dict = D
     if not updates.get("scadenza_risposta"):
         updates["scadenza_risposta"] = old.get("scadenza_risposta")
     updates["updated_at"] = iso_now()
-    # normalize assigned if provided
     if updates.get("assigned") is not None:
         updates["assigned"] = [str(x) for x in updates.get("assigned") if x]
     await db.caterings.update_one({"_id": old["_id"]}, {"$set": updates})
@@ -854,7 +845,6 @@ async def update_catering(catering_id: str, payload: CateringIn, admin: dict = D
     ]
     await log_activity(admin, "modifica_catering", f"Ha modificato il catering «{updates['titolo']}»", catering_id)
     if cambi:
-        # notify assigned employees if present, otherwise broadcast to all
         if updates.get("assigned"):
             settings = await get_settings()
             for uid in updates.get("assigned", []):
@@ -984,6 +974,7 @@ async def list_presenze(catering_id: str, admin: dict = Depends(require_admin)):
                 "presente": bool(p and p.get("presente")),
                 "importo": float(p["importo"]) if p else base,
                 "pagato": bool(p and p.get("pagato")),
+                "pagato_at": p.get("pagato_at") if p else None,
             }
         )
     return {"compenso_base": base, "righe": righe}
@@ -1112,10 +1103,14 @@ async def paga_compenso(presenza_id: str, admin: dict = Depends(require_admin)):
     if not p or not p.get("presente"):
         raise HTTPException(status_code=404, detail="Compenso non trovato")
     nuovo = not p.get("pagato")
+    
+    # Registra o rimuove il timestamp esatto di pagamento
+    timestamp_pagamento = iso_now() if nuovo else None
     await db.presenze.update_one(
         {"_id": p["_id"]},
-        {"$set": {"pagato": nuovo, "pagato_at": iso_now() if nuovo else None}},
+        {"$set": {"pagato": nuovo, "pagato_at": timestamp_pagamento}},
     )
+    
     u = await db.users.find_one({"_id": ObjectId(p["user_id"])})
     c = await db.caterings.find_one({"_id": ObjectId(p["catering_id"])})
     nome = f"{u.get('nome','')} {u.get('cognome','')}".strip() if u else "dipendente"
@@ -1128,7 +1123,7 @@ async def paga_compenso(presenza_id: str, admin: dict = Depends(require_admin)):
     )
     if nuovo:
         await notify(p["user_id"], "pagamento", f"Compenso di {p['importo']:.2f} € per «{titolo}» segnato come pagato.", p["catering_id"])
-    return {"ok": True, "pagato": nuovo}
+    return {"ok": True, "pagato": nuovo, "pagato_at": timestamp_pagamento}
 
 
 @api.post("/compensi/dipendente/{user_id}/paga-tutto")
@@ -1140,10 +1135,13 @@ async def paga_tutto(user_id: str, admin: dict = Depends(require_admin)):
     totale = sum(float(r.get("importo", 0)) for r in righe)
     if not righe:
         raise HTTPException(status_code=400, detail="Nessun compenso da pagare")
+    
+    timestamp_corrente = iso_now()
     await db.presenze.update_many(
         {"user_id": user_id, "presente": True, "pagato": False},
-        {"$set": {"pagato": True, "pagato_at": iso_now()}},
+        {"$set": {"pagato": True, "pagato_at": timestamp_corrente}},
     )
+    
     nome = f"{u.get('nome','')} {u.get('cognome','')}".strip()
     await log_activity(admin, "pagamento", f"Ha saldato {totale:.2f} € a {nome} ({len(righe)} eventi)")
     await notify(user_id, "pagamento", f"Sono stati segnati come pagati {totale:.2f} € ({len(righe)} eventi).")
@@ -1153,7 +1151,7 @@ async def paga_tutto(user_id: str, admin: dict = Depends(require_admin)):
         [f"Ciao {u.get('nome','')}, il tuo compenso di {totale:.2f} € relativo a {len(righe)} eventi è stato segnato come pagato.",
          "Puoi consultare il dettaglio nella sezione Portafoglio del gestionale."],
     )
-    return {"ok": True, "totale": round(totale, 2), "eventi": len(righe)}
+    return {"ok": True, "totale": round(totale, 2), "eventi": len(righe), "pagato_at": timestamp_corrente}
 
 
 # ---------------------------------------------------------------- dashboard e statistiche
