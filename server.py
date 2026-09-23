@@ -998,6 +998,8 @@ async def set_presenza(
         importo = float(esistente["importo"]) if esistente else await compenso_base(doc)
     if esistente and esistente.get("pagato") and not payload.presente:
         raise HTTPException(status_code=400, detail="Compenso già pagato: non è possibile rimuovere la presenza")
+    
+    # Aggiorna la presenza senza toccare la data di pagamento (che viene gestita solo dai bottoni paga)
     await db.presenze.update_one(
         {"catering_id": catering_id, "user_id": user_id},
         {
@@ -1104,7 +1106,7 @@ async def paga_compenso(presenza_id: str, admin: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="Compenso non trovato")
     nuovo = not p.get("pagato")
     
-    # Registra o rimuove il timestamp esatto di pagamento
+    # LA DATA VIENE IMPOSTATA QUI: esattamente quando l'admin clicca il bottone paga
     timestamp_pagamento = iso_now() if nuovo else None
     await db.presenze.update_one(
         {"_id": p["_id"]},
@@ -1136,6 +1138,7 @@ async def paga_tutto(user_id: str, admin: dict = Depends(require_admin)):
     if not righe:
         raise HTTPException(status_code=400, detail="Nessun compenso da pagare")
     
+    # LA DATA VIENE IMPOSTATA QUI: esattamente quando l'admin clicca paga tutto
     timestamp_corrente = iso_now()
     await db.presenze.update_many(
         {"user_id": user_id, "presente": True, "pagato": False},
